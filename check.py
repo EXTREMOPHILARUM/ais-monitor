@@ -67,7 +67,7 @@ def check_pi4():
         return "degraded", f"Degraded: {', '.join(issues or [])} (local: {local_age}s, aishub: {aishub_age}s)"
 
 
-def check_aiscatcher(pi4_ok):
+def check_aiscatcher(pi4_reachable):
     """Check AIS-catcher community station monitor API."""
     # Try JSON API first
     data = fetch_json(AISCATCHER_MONITOR)
@@ -94,10 +94,10 @@ def check_aiscatcher(pi4_ok):
             return "offline", "Station page shows Not Connected"
 
     # Fallback: infer from Pi4 health (AIS-catcher community uses TCP push from same process)
-    if pi4_ok:
-        return "ok", "Inferred healthy (Pi4 local data flowing, same AIS-catcher process)"
+    if pi4_reachable:
+        return "ok", "Inferred healthy (Pi4 reachable, AIS-catcher process running)"
     else:
-        return "unknown", "Cannot verify — Cloudflare blocked and Pi4 is down"
+        return "unknown", "Cannot verify — Cloudflare blocked and Pi4 unreachable"
 
 
 def check_aishub():
@@ -189,9 +189,9 @@ def main():
     results["Pi4 Health"] = check_pi4()
     results["AISHub"] = check_aishub()
 
-    # AIS-catcher: try API/scrape, fall back to inferring from Pi4
-    pi4_ok = results["Pi4 Health"][0] == "ok"
-    results["AIS-catcher"] = check_aiscatcher(pi4_ok)
+    # AIS-catcher: try API/scrape, fall back to inferring from Pi4 local data
+    pi4_reachable = results["Pi4 Health"][0] in ("ok", "degraded")
+    results["AIS-catcher"] = check_aiscatcher(pi4_reachable)
 
     # AISfriends: infer from AISHub if Cloudflare blocks (both use UDP from same source)
     aishub_ok = results["AISHub"][0] == "ok"
