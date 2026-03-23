@@ -2,12 +2,14 @@
 
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-PI4_HEALTH = "http://100.99.85.83:9123/health"
+PI4_IP = "100.99.85.83"
+PI4_HEALTH = f"http://{PI4_IP}:9123/health"
 AISCATCHER_MONITOR = "https://www.aiscatcher.org/api/station/monitor?id=3122"
 AISHUB_DAILY = "https://www.aishub.net/station/2387/daily-statistics.json"
 AISFRIENDS_STATS = "https://www.aisfriends.com/station-stats/869?station_only=1"
@@ -138,6 +140,20 @@ def check_aisfriends(aishub_ok):
         return "unknown", "Cannot verify — Cloudflare blocked and AISHub feed is down"
 
 
+def fetch_docker_logs(container, lines=20):
+    """SSH into Pi4 via Tailscale and fetch Docker container logs."""
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
+             f"extremo@{PI4_IP}",
+             f"docker logs --tail {lines} {container} 2>&1"],
+            capture_output=True, text=True, timeout=20,
+        )
+        return result.stdout.strip() or result.stderr.strip() or "(empty)"
+    except (subprocess.TimeoutExpired, Exception) as e:
+        return f"(failed to fetch: {e})"
+
+
 def check_ts_key_expiry():
     """Check if Tailscale auth key is expiring within 7 days."""
     try:
@@ -196,13 +212,23 @@ def main():
 
     # Send alert if anything failed
     if any_failed:
-        lines = ["🚨 *AIS Station Alert*\n"]
+        alert = ["🚨 *AIS Station Alert*\n"]
         for name, (status, message) in results.items():
-            lines.append(f"*{name}:* {status} — {message}")
+            alert.append(f"*{name}:* {status} — {message}")
         if ts_status != "ok":
-            lines.append(f"*Tailscale:* {ts_msg}")
-        lines.append(f"\n_{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_")
-        send_google_chat("\n".join(lines))
+            alert.append(f"*Tailscale:* {ts_msg}")
+
+        # Fetch Docker logs for context
+        print("\nFetching Docker logs from Pi4...")
+        for container in ("ais-ingest", "ais-catcher"):
+            logs = fetch_docker_logs(container)
+            print(f"--- {container} ---\n{logs}\n")
+            # Truncate for Google Chat (4096 char limit)
+            truncated = logs[-500:] if len(logs) > 500 else logs
+            alert.append(f"\n*{container} logs (last 20 lines):*\n```\n{truncated}\n```")
+
+        alert.append(f"\n_{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_")
+        send_google_chat("\n".join(alert))
         sys.exit(1)
     else:
         print("\nAll checks passed.")

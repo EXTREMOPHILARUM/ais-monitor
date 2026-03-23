@@ -16,9 +16,6 @@ jobs:
         with:
           authkey: ${{ secrets.TS_AUTH_KEY }}
 
-      - name: Install Playwright
-        run: pip install playwright && playwright install chromium --with-deps
-
       - name: Run monitor
         env:
           TS_KEY_EXPIRY: '2026-06-21'
