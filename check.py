@@ -210,6 +210,14 @@ def main():
         print(f"🔑 Tailscale: {ts_msg}")
         any_failed = True
 
+    # Always fetch Docker logs via SSH
+    print("\nFetching Docker logs from Pi4...")
+    docker_logs = {}
+    for container in ("ais-ingest", "ais-catcher"):
+        logs = fetch_docker_logs(container)
+        docker_logs[container] = logs
+        print(f"--- {container} ---\n{logs}\n")
+
     # Send alert if anything failed
     if any_failed:
         alert = ["🚨 *AIS Station Alert*\n"]
@@ -218,12 +226,7 @@ def main():
         if ts_status != "ok":
             alert.append(f"*Tailscale:* {ts_msg}")
 
-        # Fetch Docker logs for context
-        print("\nFetching Docker logs from Pi4...")
-        for container in ("ais-ingest", "ais-catcher"):
-            logs = fetch_docker_logs(container)
-            print(f"--- {container} ---\n{logs}\n")
-            # Truncate for Google Chat (4096 char limit)
+        for container, logs in docker_logs.items():
             truncated = logs[-500:] if len(logs) > 500 else logs
             alert.append(f"\n*{container} logs (last 20 lines):*\n```\n{truncated}\n```")
 
@@ -231,7 +234,7 @@ def main():
         send_google_chat("\n".join(alert))
         sys.exit(1)
     else:
-        print("\nAll checks passed.")
+        print("All checks passed.")
 
 
 if __name__ == "__main__":
