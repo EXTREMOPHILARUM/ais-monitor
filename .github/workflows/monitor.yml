@@ -92,6 +92,23 @@ jobs:
             -H 'Content-Type: application/json' \
             -d "{\"text\": \"${TEXT}\"}"
 
+      - name: Check Tailscale key expiry
+        id: tskey
+        env:
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+        run: |
+          # Tailscale auth key expires 2026-06-21
+          EXPIRY="2026-06-21"
+          TODAY=$(date -u '+%Y-%m-%d')
+          DAYS_LEFT=$(( ($(date -d "$EXPIRY" +%s) - $(date -d "$TODAY" +%s)) / 86400 ))
+
+          if [ $DAYS_LEFT -le 7 ]; then
+            TEXT="🔑 *Tailscale Key Expiring*\n\nAuth key expires in ${DAYS_LEFT} days ($EXPIRY).\nRenew at: https://login.tailscale.com/admin/settings/keys\nThen update TS_AUTH_KEY secret in this repo.\n\n_$(date -u '+%Y-%m-%d %H:%M UTC')_"
+            curl -s -X POST "$GOOGLE_CHAT_WEBHOOK" \
+              -H 'Content-Type: application/json' \
+              -d "{\"text\": \"${TEXT}\"}"
+          fi
+
       - name: Send AISHub alert
         if: steps.health.outputs.status == 'ok' && steps.aishub.outputs.status == 'offline'
         env:
