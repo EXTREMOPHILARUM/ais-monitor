@@ -14,9 +14,7 @@ jobs:
       - name: Setup Tailscale
         uses: tailscale/github-action@v3
         with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci
+          authkey: ${{ secrets.TS_AUTH_KEY }}
 
       - name: Check Pi health endpoint
         id: health
