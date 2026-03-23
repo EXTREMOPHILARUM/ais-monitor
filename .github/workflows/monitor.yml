@@ -32,7 +32,6 @@ jobs:
             exit 0
           fi
 
-          echo "response=$RESPONSE" >> $GITHUB_OUTPUT
           STATUS=$(echo "$RESPONSE" | jq -r '.status // "unknown"')
           ISSUES=$(echo "$RESPONSE" | jq -r '.issues // [] | join(", ")')
           LOCAL_AGE=$(echo "$RESPONSE" | jq -r '.local_age_s // "null"')
@@ -46,49 +45,102 @@ jobs:
             echo "message=Degraded: ${ISSUES} (local: ${LOCAL_AGE}s, aishub: ${AISHUB_AGE}s)" >> $GITHUB_OUTPUT
           fi
 
+      - name: Check AIS-catcher community
+        id: aiscatcher
+        run: |
+          set +e
+          RESPONSE=$(curl -s --max-time 15 \
+            -H "X-Requested-With: XMLHttpRequest" \
+            -H "Accept: application/json" \
+            "https://www.aiscatcher.org/api/station/monitor?id=3122")
+
+          if ! echo "$RESPONSE" | jq -e . > /dev/null 2>&1; then
+            echo "status=blocked" >> $GITHUB_OUTPUT
+            echo "message=Cloudflare blocked request" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          ONLINE=$(echo "$RESPONSE" | jq -r '.online // false')
+          AGO=$(echo "$RESPONSE" | jq -r '.ago_seconds // "null"')
+          MESSAGES=$(echo "$RESPONSE" | jq -r '.stats.messages // 0')
+          SHIPS=$(echo "$RESPONSE" | jq -r '.stats.ships // 0')
+
+          if [ "$ONLINE" = "true" ]; then
+            echo "status=ok" >> $GITHUB_OUTPUT
+            echo "message=Online, ${SHIPS} ships, ${MESSAGES} msgs, last ${AGO}s ago" >> $GITHUB_OUTPUT
+          else
+            echo "status=offline" >> $GITHUB_OUTPUT
+            echo "message=Station offline (last seen ${AGO}s ago)" >> $GITHUB_OUTPUT
+          fi
+
       - name: Check AISHub station
         id: aishub
         run: |
           set +e
-          # Check if our station appears on AISHub
-          RESPONSE=$(curl -s --max-time 15 "https://www.aishub.net/stations/2387")
-          if echo "$RESPONSE" | grep -qi "online\|active\|last seen"; then
-            echo "status=ok" >> $GITHUB_OUTPUT
-          elif echo "$RESPONSE" | grep -qi "offline"; then
-            echo "status=offline" >> $GITHUB_OUTPUT
-            echo "message=AISHub shows station as offline" >> $GITHUB_OUTPUT
-          else
-            echo "status=unknown" >> $GITHUB_OUTPUT
-            echo "message=Could not determine AISHub station status" >> $GITHUB_OUTPUT
+          RESPONSE=$(curl -s --max-time 15 \
+            -H "X-Requested-With: XMLHttpRequest" \
+            -H "Accept: application/json" \
+            "https://www.aishub.net/station/2387/daily-statistics.json")
+
+          if [ -z "$RESPONSE" ]; then
+            echo "status=no_data" >> $GITHUB_OUTPUT
+            echo "message=No data from AISHub (station may be offline)" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-      - name: Check AIS-catcher community
-        id: community
+          # Check last values in count array — nulls mean offline
+          LAST_VALUES=$(echo "$RESPONSE" | jq -r '[.count[-6:] | .[] | select(. != null)] | length')
+
+          if [ "$LAST_VALUES" -gt 0 ] 2>/dev/null; then
+            LATEST=$(echo "$RESPONSE" | jq -r '[.count[] | select(. != null)] | last')
+            echo "status=ok" >> $GITHUB_OUTPUT
+            echo "message=Active, latest count: ${LATEST} ships" >> $GITHUB_OUTPUT
+          else
+            echo "status=inactive" >> $GITHUB_OUTPUT
+            echo "message=Last 30min all nulls — station not feeding AISHub" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check AISfriends station
+        id: aisfriends
         run: |
           set +e
-          RESPONSE=$(curl -s --max-time 15 "https://aiscatcher.org/")
-          # Just check if the site is reachable — station-specific check would need their API
-          if [ $? -eq 0 ]; then
-            echo "status=ok" >> $GITHUB_OUTPUT
-          else
-            echo "status=error" >> $GITHUB_OUTPUT
+          RESPONSE=$(curl -s --max-time 15 \
+            -H "X-Requested-With: XMLHttpRequest" \
+            -H "Accept: application/json" \
+            "https://www.aisfriends.com/station-stats/869?station_only=1")
+
+          if ! echo "$RESPONSE" | jq -e . > /dev/null 2>&1; then
+            echo "status=blocked" >> $GITHUB_OUTPUT
+            echo "message=Cloudflare blocked request" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-      - name: Send alert if unhealthy
-        if: steps.health.outputs.status != 'ok'
+          VESSELS=$(echo "$RESPONSE" | jq -r '.vessels_count // 0')
+          UPTIME=$(echo "$RESPONSE" | jq -r '.uptime // 0')
+
+          if [ "$VESSELS" -gt 0 ] 2>/dev/null; then
+            echo "status=ok" >> $GITHUB_OUTPUT
+            echo "message=${VESSELS} vessels, ${UPTIME}% uptime" >> $GITHUB_OUTPUT
+          else
+            echo "status=inactive" >> $GITHUB_OUTPUT
+            echo "message=0 vessels on AISfriends (uptime: ${UPTIME}%)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send alert if any check failed
+        if: |
+          steps.health.outputs.status != 'ok' ||
+          steps.aiscatcher.outputs.status == 'offline' ||
+          steps.aishub.outputs.status == 'no_data' ||
+          steps.aishub.outputs.status == 'inactive' ||
+          steps.aisfriends.outputs.status == 'inactive'
         env:
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
         run: |
-          HEALTH_STATUS="${{ steps.health.outputs.status }}"
-          HEALTH_MSG="${{ steps.health.outputs.message }}"
-          AISHUB_STATUS="${{ steps.aishub.outputs.status }}"
-          AISHUB_MSG="${{ steps.aishub.outputs.message }}"
-
           TEXT="🚨 *AIS Station Alert*\n\n"
-          TEXT+="*Health:* ${HEALTH_STATUS} — ${HEALTH_MSG}\n"
-          if [ "$AISHUB_STATUS" != "ok" ]; then
-            TEXT+="*AISHub:* ${AISHUB_STATUS} — ${AISHUB_MSG}\n"
-          fi
+          TEXT+="*Pi4 Health:* ${{ steps.health.outputs.status }} — ${{ steps.health.outputs.message }}\n"
+          TEXT+="*AIS-catcher:* ${{ steps.aiscatcher.outputs.status }} — ${{ steps.aiscatcher.outputs.message }}\n"
+          TEXT+="*AISHub:* ${{ steps.aishub.outputs.status }} — ${{ steps.aishub.outputs.message }}\n"
+          TEXT+="*AISfriends:* ${{ steps.aisfriends.outputs.status }} — ${{ steps.aisfriends.outputs.message }}\n"
           TEXT+="\n_$(date -u '+%Y-%m-%d %H:%M UTC')_"
 
           curl -s -X POST "$GOOGLE_CHAT_WEBHOOK" \
@@ -96,7 +148,6 @@ jobs:
             -d "{\"text\": \"${TEXT}\"}"
 
       - name: Check Tailscale key expiry
-        id: tskey
         env:
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
         run: |
@@ -110,17 +161,3 @@ jobs:
               -H 'Content-Type: application/json' \
               -d "{\"text\": \"${TEXT}\"}"
           fi
-
-      - name: Send AISHub alert
-        if: steps.health.outputs.status == 'ok' && steps.aishub.outputs.status == 'offline'
-        env:
-          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
-        run: |
-          TEXT="⚠️ *AIS Station Warning*\n\n"
-          TEXT+="Pi4 is healthy but AISHub shows station offline.\n"
-          TEXT+="UDP feed to AISHub may be blocked or failing.\n"
-          TEXT+="\n_$(date -u '+%Y-%m-%d %H:%M UTC')_"
-
-          curl -s -X POST "$GOOGLE_CHAT_WEBHOOK" \
-            -H 'Content-Type: application/json' \
-            -d "{\"text\": \"${TEXT}\"}"
