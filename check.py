@@ -65,7 +65,7 @@ def check_pi4():
         return "degraded", f"Degraded: {', '.join(issues or [])} (local: {local_age}s, aishub: {aishub_age}s)"
 
 
-def check_aiscatcher():
+def check_aiscatcher(pi4_ok):
     """Check AIS-catcher community station monitor API."""
     # Try JSON API first
     data = fetch_json(AISCATCHER_MONITOR)
@@ -84,17 +84,18 @@ def check_aiscatcher():
     # Fallback: scrape the station page
     print("  ↳ API blocked, scraping page...")
     html = fetch_page_text("https://www.aiscatcher.org/station/3122")
-    if html is None or "Just a moment" in html or "Attention Required" in html:
-        return "error", "Cannot reach AIS-catcher (Cloudflare blocked)"
+    if html is not None and "Just a moment" not in html and "Attention Required" not in html:
+        import re
+        if re.search(r'"active"|Active', html):
+            return "ok", "Station page shows Active"
+        elif re.search(r'"not_active"|Not Connected', html):
+            return "offline", "Station page shows Not Connected"
 
-    import re
-    # Look for status indicators in the page
-    if re.search(r'"active"|Active', html):
-        return "ok", "Station page shows Active"
-    elif re.search(r'"not_active"|Not Connected', html):
-        return "offline", "Station page shows Not Connected"
+    # Fallback: infer from Pi4 health (AIS-catcher community uses TCP push from same process)
+    if pi4_ok:
+        return "ok", "Inferred healthy (Pi4 local data flowing, same AIS-catcher process)"
     else:
-        return "unknown", "Could not parse station status from page"
+        return "unknown", "Cannot verify — Cloudflare blocked and Pi4 is down"
 
 
 def check_aishub():
@@ -169,13 +170,12 @@ def main():
     any_failed = False
 
     # Run checks in order — AISfriends depends on Pi4 health result
-    for name, fn in [
-        ("Pi4 Health", lambda: check_pi4()),
-        ("AIS-catcher", lambda: check_aiscatcher()),
-        ("AISHub", lambda: check_aishub()),
-    ]:
-        status, message = fn()
-        results[name] = (status, message)
+    results["Pi4 Health"] = check_pi4()
+    results["AISHub"] = check_aishub()
+
+    # AIS-catcher: try API/scrape, fall back to inferring from Pi4
+    pi4_ok = results["Pi4 Health"][0] == "ok"
+    results["AIS-catcher"] = check_aiscatcher(pi4_ok)
 
     # AISfriends: infer from AISHub if Cloudflare blocks (both use UDP from same source)
     aishub_ok = results["AISHub"][0] == "ok"
