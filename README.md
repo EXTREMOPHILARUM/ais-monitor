@@ -7,21 +7,26 @@ GitHub Actions-based monitoring for the AIS station on Pi4. Runs hourly, connect
 | Check | Method | Fallback |
 |-------|--------|----------|
 | **Pi4 Health** | Direct HTTP via Tailscale (`/health` endpoint) | — |
-| **AISHub** | JSON API (`/station/2387/daily-statistics.json`) | — |
-| **AIS-catcher** | JSON API → page scrape | Inferred from Pi4 health |
+| **AISHub** | JSON API (`/station/2387/daily-statistics.json` with `X-Requested-With` header) | — |
+| **AIS-catcher** | JSON API → page scrape | Inferred from Pi4 reachability |
 | **AISfriends** | JSON API | Inferred from AISHub (same UDP source) |
+| **Tailscale key** | Checks days until expiry | Alerts 7 days before |
 
-AIS-catcher and AISfriends are behind Cloudflare, which blocks API/scrape requests from CI. When blocked, status is inferred: if AIS-catcher is sending data to our ingest (Pi4 healthy), the TCP push to aiscatcher.org is working. If AISHub is receiving data (UDP), AISfriends is too (same UDP from same process).
+AIS-catcher and AISfriends are behind Cloudflare, which blocks API/scrape requests from CI. When blocked, status is inferred: if Pi4 is reachable, AIS-catcher is running. If AISHub is receiving data (UDP), AISfriends is too (same UDP from same process).
 
-## Alerts
+## On failure
 
-Sends Google Chat webhook notifications when:
-- Pi4 is unreachable or ingest service is degraded
-- AISHub shows station inactive (trailing nulls in daily stats)
-- AIS-catcher or AISfriends detected as offline
-- Tailscale auth key expiring within 7 days
+When any check fails:
+- Docker logs from both `ais-ingest` and `ais-catcher` are fetched via Tailscale SSH
+- All results + logs are sent as a Google Chat notification
 
-On failure, Docker logs from both `ais-ingest` and `ais-catcher` containers are fetched via Tailscale SSH and included in the alert.
+Docker logs are always fetched (even on success) and printed to the GitHub Actions log for debugging.
+
+## Health endpoint thresholds
+
+The Pi4 `/health` endpoint reports `degraded` when:
+- Local AIS-catcher data is stale (>30s since last POST)
+- AISHub poll is stale (>180s since last successful poll)
 
 ## Setup
 
@@ -34,7 +39,7 @@ On failure, Docker logs from both `ais-ingest` and `ais-catcher` containers are 
 
 ### Tailscale ACL
 
-The ACL policy needs `tag:ci` defined and an SSH accept rule:
+The ACL policy needs `tag:ci` defined and an SSH accept rule so the GitHub Action runner can SSH into the Pi4 for Docker logs:
 
 ```jsonc
 "tagOwners": {
@@ -52,8 +57,20 @@ The ACL policy needs `tag:ci` defined and an SSH accept rule:
 ],
 ```
 
+### Tailscale SSH on Pi4
+
+Enable Tailscale SSH on the Pi4:
+
+```bash
+sudo tailscale set --ssh --accept-risk=lose-ssh
+```
+
 ### Local testing
 
 ```bash
-GOOGLE_CHAT_WEBHOOK="" python3 check.py
+# Without alerts
+python3 check.py
+
+# With alerts
+GOOGLE_CHAT_WEBHOOK="https://chat.googleapis.com/..." python3 check.py
 ```
