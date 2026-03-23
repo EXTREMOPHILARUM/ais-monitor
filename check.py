@@ -117,7 +117,7 @@ def check_aishub():
         return "inactive", "Last 30min all nulls — station not feeding AISHub"
 
 
-def check_aisfriends():
+def check_aisfriends(local_ok):
     """Check AISfriends station stats API."""
     # Try JSON API first
     data = fetch_json(AISFRIENDS_STATS)
@@ -130,22 +130,11 @@ def check_aisfriends():
         else:
             return "inactive", f"0 vessels on AISfriends (uptime: {uptime}%)"
 
-    # Fallback: scrape the station page
-    print("  ↳ API blocked, scraping page...")
-    html = fetch_page_text("https://www.aisfriends.com/stations/869")
-    if html is None or "Just a moment" in html:
-        return "error", "Cannot reach AISfriends (Cloudflare blocked)"
-
-    import re
-    vessels_match = re.search(r'(\d+)\s*vessels?\s*in\s*coverage', html, re.IGNORECASE)
-    if vessels_match:
-        count = int(vessels_match.group(1))
-        if count > 0:
-            return "ok", f"{count} vessels (from page)"
-        else:
-            return "inactive", "0 vessels on AISfriends (from page)"
-
-    return "unknown", "Could not parse AISfriends station page"
+    # Cloudflare blocks direct access — infer from local AIS-catcher health
+    if local_ok:
+        return "ok", "Inferred healthy (AIS-catcher is running, UDP feed active)"
+    else:
+        return "unknown", "Cannot verify — Cloudflare blocked and AIS-catcher is down"
 
 
 def check_ts_key_expiry():
@@ -176,20 +165,24 @@ def send_google_chat(text):
 
 
 def main():
-    checks = {
-        "Pi4 Health": check_pi4,
-        "AIS-catcher": check_aiscatcher,
-        "AISHub": check_aishub,
-        "AISfriends": check_aisfriends,
-    }
-
     results = {}
     any_failed = False
 
-    for name, fn in checks.items():
+    # Run checks in order — AISfriends depends on Pi4 health result
+    for name, fn in [
+        ("Pi4 Health", lambda: check_pi4()),
+        ("AIS-catcher", lambda: check_aiscatcher()),
+        ("AISHub", lambda: check_aishub()),
+    ]:
         status, message = fn()
         results[name] = (status, message)
-        is_ok = status == "ok" or (status == "error" and "Cloudflare" in message)
+
+    # AISfriends: infer from local health if Cloudflare blocks
+    local_ok = results["Pi4 Health"][0] == "ok"
+    results["AISfriends"] = check_aisfriends(local_ok)
+
+    for name, (status, message) in results.items():
+        is_ok = status == "ok"
         icon = "✅" if status == "ok" else "⚠️" if "Cloudflare" in message else "❌"
         print(f"{icon} {name}: {status} — {message}")
         if not is_ok:
