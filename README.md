@@ -1,49 +1,59 @@
 # AIS Station Monitor
 
-GitHub Actions-based monitoring for the AIS station on Pi4. Runs every 15 minutes, connects via Tailscale, and sends Google Chat alerts on failure.
+GitHub Actions-based monitoring for the AIS station on Pi4. Runs hourly, connects via Tailscale, and sends Google Chat alerts on failure.
 
 ## What it checks
 
-1. **Pi4 health endpoint** (`http://100.99.85.83:9123/health`) — verifies ingest service is running, local AIS data and AISHub data are flowing
-2. **AISHub station page** — verifies station is listed as active
-3. **AIS-catcher community** — basic reachability check
+| Check | Method | Fallback |
+|-------|--------|----------|
+| **Pi4 Health** | Direct HTTP via Tailscale (`/health` endpoint) | — |
+| **AISHub** | JSON API (`/station/2387/daily-statistics.json`) | — |
+| **AIS-catcher** | JSON API → page scrape | Inferred from Pi4 health |
+| **AISfriends** | JSON API | Inferred from AISHub (same UDP source) |
+
+AIS-catcher and AISfriends are behind Cloudflare, which blocks API/scrape requests from CI. When blocked, status is inferred: if AIS-catcher is sending data to our ingest (Pi4 healthy), the TCP push to aiscatcher.org is working. If AISHub is receiving data (UDP), AISfriends is too (same UDP from same process).
 
 ## Alerts
 
 Sends Google Chat webhook notifications when:
-- Pi4 is unreachable (down, network issue, Tailscale disconnected)
-- Ingest service is degraded (local data stale >30s, AISHub stale >120s)
-- AISHub shows station as offline (UDP feed issue)
+- Pi4 is unreachable or ingest service is degraded
+- AISHub shows station inactive (trailing nulls in daily stats)
+- AIS-catcher or AISfriends detected as offline
+- Tailscale auth key expiring within 7 days
+
+On failure, Docker logs from both `ais-ingest` and `ais-catcher` containers are fetched via Tailscale SSH and included in the alert.
 
 ## Setup
 
-### 1. Tailscale OAuth client
-
-Create an OAuth client for GitHub Actions to join your Tailscale network:
-
-1. Go to [Tailscale Admin Console](https://login.tailscale.com/admin/settings/oauth) → OAuth clients
-2. Create new OAuth client with tag `tag:ci`
-3. Add to your Tailscale ACL policy:
-   ```json
-   "tagOwners": {
-     "tag:ci": ["autogroup:admin"]
-   }
-   ```
-4. Add secrets to this repo:
-   - `TS_OAUTH_CLIENT_ID` — OAuth client ID
-   - `TS_OAUTH_SECRET` — OAuth client secret
-
-### 2. Google Chat webhook
-
-1. In Google Chat, go to the space where you want alerts
-2. Apps & integrations → Webhooks → Create webhook
-3. Copy the webhook URL
-4. Add as repo secret: `GOOGLE_CHAT_WEBHOOK`
-
-### 3. Required secrets
+### Required secrets
 
 | Secret | Description |
 |--------|-------------|
-| `TS_OAUTH_CLIENT_ID` | Tailscale OAuth client ID |
-| `TS_OAUTH_SECRET` | Tailscale OAuth client secret |
+| `TS_AUTH_KEY` | Tailscale auth key (ephemeral + reusable) |
 | `GOOGLE_CHAT_WEBHOOK` | Google Chat incoming webhook URL |
+
+### Tailscale ACL
+
+The ACL policy needs `tag:ci` defined and an SSH accept rule:
+
+```jsonc
+"tagOwners": {
+    "tag:ci": ["autogroup:admin"],
+},
+
+"ssh": [
+    // ... existing rules ...
+    {
+        "action": "accept",
+        "src":    ["tag:ci"],
+        "dst":    ["autogroup:self"],
+        "users":  ["extremo"],
+    },
+],
+```
+
+### Local testing
+
+```bash
+GOOGLE_CHAT_WEBHOOK="" python3 check.py
+```
