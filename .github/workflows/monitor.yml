@@ -1,0 +1,109 @@
+name: AIS Station Monitor
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'  # every 15 minutes
+  workflow_dispatch: {}       # manual trigger
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Check Pi health endpoint
+        id: health
+        run: |
+          set +e
+          RESPONSE=$(curl -s --connect-timeout 10 --max-time 15 http://100.99.85.83:9123/health)
+          CURL_EXIT=$?
+
+          if [ $CURL_EXIT -ne 0 ]; then
+            echo "status=unreachable" >> $GITHUB_OUTPUT
+            echo "message=Pi4 is unreachable (curl exit: $CURL_EXIT)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "response=$RESPONSE" >> $GITHUB_OUTPUT
+          STATUS=$(echo "$RESPONSE" | jq -r '.status // "unknown"')
+          ISSUES=$(echo "$RESPONSE" | jq -r '.issues // [] | join(", ")')
+          LOCAL_AGE=$(echo "$RESPONSE" | jq -r '.local_age_s // "null"')
+          AISHUB_AGE=$(echo "$RESPONSE" | jq -r '.aishub_age_s // "null"')
+
+          if [ "$STATUS" = "ok" ]; then
+            echo "status=ok" >> $GITHUB_OUTPUT
+            echo "message=All systems healthy (local: ${LOCAL_AGE}s, aishub: ${AISHUB_AGE}s)" >> $GITHUB_OUTPUT
+          else
+            echo "status=degraded" >> $GITHUB_OUTPUT
+            echo "message=Degraded: ${ISSUES} (local: ${LOCAL_AGE}s, aishub: ${AISHUB_AGE}s)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check AISHub station
+        id: aishub
+        run: |
+          set +e
+          # Check if our station appears on AISHub
+          RESPONSE=$(curl -s --max-time 15 "https://www.aishub.net/stations/2387")
+          if echo "$RESPONSE" | grep -qi "online\|active\|last seen"; then
+            echo "status=ok" >> $GITHUB_OUTPUT
+          elif echo "$RESPONSE" | grep -qi "offline"; then
+            echo "status=offline" >> $GITHUB_OUTPUT
+            echo "message=AISHub shows station as offline" >> $GITHUB_OUTPUT
+          else
+            echo "status=unknown" >> $GITHUB_OUTPUT
+            echo "message=Could not determine AISHub station status" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check AIS-catcher community
+        id: community
+        run: |
+          set +e
+          RESPONSE=$(curl -s --max-time 15 "https://aiscatcher.org/")
+          # Just check if the site is reachable — station-specific check would need their API
+          if [ $? -eq 0 ]; then
+            echo "status=ok" >> $GITHUB_OUTPUT
+          else
+            echo "status=error" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send alert if unhealthy
+        if: steps.health.outputs.status != 'ok'
+        env:
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+        run: |
+          HEALTH_STATUS="${{ steps.health.outputs.status }}"
+          HEALTH_MSG="${{ steps.health.outputs.message }}"
+          AISHUB_STATUS="${{ steps.aishub.outputs.status }}"
+          AISHUB_MSG="${{ steps.aishub.outputs.message }}"
+
+          TEXT="🚨 *AIS Station Alert*\n\n"
+          TEXT+="*Health:* ${HEALTH_STATUS} — ${HEALTH_MSG}\n"
+          if [ "$AISHUB_STATUS" != "ok" ]; then
+            TEXT+="*AISHub:* ${AISHUB_STATUS} — ${AISHUB_MSG}\n"
+          fi
+          TEXT+="\n_$(date -u '+%Y-%m-%d %H:%M UTC')_"
+
+          curl -s -X POST "$GOOGLE_CHAT_WEBHOOK" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\": \"${TEXT}\"}"
+
+      - name: Send AISHub alert
+        if: steps.health.outputs.status == 'ok' && steps.aishub.outputs.status == 'offline'
+        env:
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+        run: |
+          TEXT="⚠️ *AIS Station Warning*\n\n"
+          TEXT+="Pi4 is healthy but AISHub shows station offline.\n"
+          TEXT+="UDP feed to AISHub may be blocked or failing.\n"
+          TEXT+="\n_$(date -u '+%Y-%m-%d %H:%M UTC')_"
+
+          curl -s -X POST "$GOOGLE_CHAT_WEBHOOK" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\": \"${TEXT}\"}"
