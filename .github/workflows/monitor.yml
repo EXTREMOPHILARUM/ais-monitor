@@ -5,6 +5,9 @@ on:
     - cron: '*/15 * * * *'  # every 15 minutes
   workflow_dispatch: {}       # manual trigger
 
+env:
+  TS_KEY_EXPIRY: '2026-06-21'
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -97,8 +100,7 @@ jobs:
         env:
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
         run: |
-          # Tailscale auth key expires 2026-06-21
-          EXPIRY="2026-06-21"
+          EXPIRY="${{ env.TS_KEY_EXPIRY }}"
           TODAY=$(date -u '+%Y-%m-%d')
           DAYS_LEFT=$(( ($(date -d "$EXPIRY" +%s) - $(date -d "$TODAY" +%s)) / 86400 ))
 
