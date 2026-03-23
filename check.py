@@ -117,7 +117,7 @@ def check_aishub():
         return "inactive", "Last 30min all nulls — station not feeding AISHub"
 
 
-def check_aisfriends(local_ok):
+def check_aisfriends(aishub_ok):
     """Check AISfriends station stats API."""
     # Try JSON API first
     data = fetch_json(AISFRIENDS_STATS)
@@ -130,11 +130,11 @@ def check_aisfriends(local_ok):
         else:
             return "inactive", f"0 vessels on AISfriends (uptime: {uptime}%)"
 
-    # Cloudflare blocks direct access — infer from local AIS-catcher health
-    if local_ok:
-        return "ok", "Inferred healthy (AIS-catcher is running, UDP feed active)"
+    # Cloudflare blocks direct access — infer from AISHub (both use UDP from same source)
+    if aishub_ok:
+        return "ok", "Inferred healthy (AISHub UDP feed active, same source)"
     else:
-        return "unknown", "Cannot verify — Cloudflare blocked and AIS-catcher is down"
+        return "unknown", "Cannot verify — Cloudflare blocked and AISHub feed is down"
 
 
 def check_ts_key_expiry():
@@ -177,9 +177,9 @@ def main():
         status, message = fn()
         results[name] = (status, message)
 
-    # AISfriends: infer from local health if Cloudflare blocks
-    local_ok = results["Pi4 Health"][0] == "ok"
-    results["AISfriends"] = check_aisfriends(local_ok)
+    # AISfriends: infer from AISHub if Cloudflare blocks (both use UDP from same source)
+    aishub_ok = results["AISHub"][0] == "ok"
+    results["AISfriends"] = check_aisfriends(aishub_ok)
 
     for name, (status, message) in results.items():
         is_ok = status == "ok"
