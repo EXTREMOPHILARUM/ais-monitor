@@ -35,6 +35,19 @@ def fetch_json(url, timeout=15):
         return {"_error": str(e)}
 
 
+def fetch_page_text(url, timeout=15):
+    """Fetch HTML page and return its text content."""
+    try:
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html",
+        })
+        with urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode()
+    except (URLError, TimeoutError) as e:
+        return None
+
+
 def check_pi4():
     """Check the Pi4 ingest health endpoint via Tailscale."""
     data = fetch_json(PI4_HEALTH)
@@ -54,21 +67,34 @@ def check_pi4():
 
 def check_aiscatcher():
     """Check AIS-catcher community station monitor API."""
+    # Try JSON API first
     data = fetch_json(AISCATCHER_MONITOR)
-    if data is None or "_error" in (data or {}):
-        err = data.get("_error", "no response") if data else "no response"
-        return "blocked", f"Cannot reach AIS-catcher API: {err}"
+    if data is not None and "_error" not in data:
+        online = data.get("online", False)
+        ago = data.get("ago_seconds")
+        stats = data.get("stats", {})
+        ships = stats.get("ships", 0)
+        messages = stats.get("messages", 0)
 
-    online = data.get("online", False)
-    ago = data.get("ago_seconds")
-    stats = data.get("stats", {})
-    ships = stats.get("ships", 0)
-    messages = stats.get("messages", 0)
+        if online:
+            return "ok", f"Online, {ships} ships, {messages} msgs, last {ago:.0f}s ago"
+        else:
+            return "offline", f"Station offline (last seen {ago}s ago)"
 
-    if online:
-        return "ok", f"Online, {ships} ships, {messages} msgs, last {ago:.0f}s ago"
+    # Fallback: scrape the station page
+    print("  ↳ API blocked, scraping page...")
+    html = fetch_page_text("https://www.aiscatcher.org/station/3122")
+    if html is None or "Just a moment" in html or "Attention Required" in html:
+        return "error", "Cannot reach AIS-catcher (Cloudflare blocked)"
+
+    import re
+    # Look for status indicators in the page
+    if re.search(r'"active"|Active', html):
+        return "ok", "Station page shows Active"
+    elif re.search(r'"not_active"|Not Connected', html):
+        return "offline", "Station page shows Not Connected"
     else:
-        return "offline", f"Station offline (last seen {ago}s ago)"
+        return "unknown", "Could not parse station status from page"
 
 
 def check_aishub():
@@ -93,18 +119,33 @@ def check_aishub():
 
 def check_aisfriends():
     """Check AISfriends station stats API."""
+    # Try JSON API first
     data = fetch_json(AISFRIENDS_STATS)
-    if data is None or "_error" in (data or {}):
-        err = data.get("_error", "no response") if data else "no response"
-        return "blocked", f"Cannot reach AISfriends API: {err}"
+    if data is not None and "_error" not in data:
+        vessels = data.get("vessels_count", 0)
+        uptime = data.get("uptime", 0)
 
-    vessels = data.get("vessels_count", 0)
-    uptime = data.get("uptime", 0)
+        if vessels > 0:
+            return "ok", f"{vessels} vessels, {uptime}% uptime"
+        else:
+            return "inactive", f"0 vessels on AISfriends (uptime: {uptime}%)"
 
-    if vessels > 0:
-        return "ok", f"{vessels} vessels, {uptime}% uptime"
-    else:
-        return "inactive", f"0 vessels on AISfriends (uptime: {uptime}%)"
+    # Fallback: scrape the station page
+    print("  ↳ API blocked, scraping page...")
+    html = fetch_page_text("https://www.aisfriends.com/stations/869")
+    if html is None or "Just a moment" in html:
+        return "error", "Cannot reach AISfriends (Cloudflare blocked)"
+
+    import re
+    vessels_match = re.search(r'(\d+)\s*vessels?\s*in\s*coverage', html, re.IGNORECASE)
+    if vessels_match:
+        count = int(vessels_match.group(1))
+        if count > 0:
+            return "ok", f"{count} vessels (from page)"
+        else:
+            return "inactive", "0 vessels on AISfriends (from page)"
+
+    return "unknown", "Could not parse AISfriends station page"
 
 
 def check_ts_key_expiry():
@@ -148,9 +189,10 @@ def main():
     for name, fn in checks.items():
         status, message = fn()
         results[name] = (status, message)
-        icon = "✅" if status == "ok" else "⚠️" if status == "blocked" else "❌"
+        is_ok = status == "ok" or (status == "error" and "Cloudflare" in message)
+        icon = "✅" if status == "ok" else "⚠️" if "Cloudflare" in message else "❌"
         print(f"{icon} {name}: {status} — {message}")
-        if status not in ("ok", "blocked"):
+        if not is_ok:
             any_failed = True
 
     # Check TS key
