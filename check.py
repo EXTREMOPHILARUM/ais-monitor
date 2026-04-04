@@ -154,6 +154,24 @@ def fetch_docker_logs(container, lines=20):
         return f"(failed to fetch: {e})"
 
 
+def check_docker_errors():
+    """Check Docker logs for Python errors/exceptions in the last hour."""
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
+             f"extremo@{PI4_IP}",
+             "docker logs --since 1h ais-ingest 2>&1 | grep -iE 'Error|Exception|Traceback|Failed' | grep -v 'recv()' | tail -10"],
+            capture_output=True, text=True, timeout=20,
+        )
+        errors = result.stdout.strip()
+        if not errors:
+            return "ok", "No errors in last hour"
+        error_count = len(errors.splitlines())
+        return "errors", f"{error_count} errors in last hour:\n{errors}"
+    except (subprocess.TimeoutExpired, Exception) as e:
+        return "unknown", f"Could not check logs: {e}"
+
+
 def check_ts_key_expiry():
     """Check if Tailscale auth key is expiring within 7 days."""
     try:
@@ -196,6 +214,9 @@ def main():
     # AISfriends: infer from AISHub if Cloudflare blocks (both use UDP from same source)
     aishub_ok = results["AISHub"][0] == "ok"
     results["AISfriends"] = check_aisfriends(aishub_ok)
+
+    # Check Docker logs for Python errors
+    results["App Errors"] = check_docker_errors()
 
     for name, (status, message) in results.items():
         is_ok = status == "ok"
