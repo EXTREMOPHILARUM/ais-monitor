@@ -1,4 +1,14 @@
-"""AIS Station Monitor — checks Pi4 health, AIS-catcher, AISHub, AISfriends."""
+"""AIS station + API monitor.
+
+Watches the consolidated stack on the miniserver:
+- ais-catcher (RTL-SDR decode)
+- ais-ingest (local-radio buffer + forwarder)
+- ais-api (FastAPI serve, Postgres-backed) via the public Cloudflare tunnel
+- AISHub / AISfriends / AIS-catcher community feeds (downstream visibility)
+
+The Pi4 is no longer in the loop — RTL-SDR was moved to the miniserver after
+the Pi died. All checks now target miniserver (Tailscale 100.86.157.26).
+"""
 
 import json
 import os
@@ -8,8 +18,10 @@ from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-PI4_IP = "100.99.85.83"
-PI4_HEALTH = f"http://{PI4_IP}:9123/health"
+MINISERVER_IP = "100.86.157.26"
+MINISERVER_USER = "extremo"
+INGEST_HEALTH = f"http://{MINISERVER_IP}:9123/health"
+API_HEALTH_PUBLIC = "https://api.saurabhn.com/health"
 AISCATCHER_MONITOR = "https://www.aiscatcher.org/api/station/monitor?id=3122"
 AISHUB_DAILY = "https://www.aishub.net/station/2387/daily-statistics.json"
 AISFRIENDS_STATS = "https://www.aisfriends.com/station-stats/869?station_only=1"
@@ -20,12 +32,15 @@ HEADERS = {
     "User-Agent": "AIS-Monitor/1.0",
 }
 
+# Containers we check Docker logs for — all on the miniserver now.
+LOG_CONTAINERS = ("ais-catcher", "ais-ingest", "ais-api")
+
 TS_KEY_EXPIRY = os.environ.get("TS_KEY_EXPIRY", "2026-06-21")
 GOOGLE_CHAT_WEBHOOK = os.environ.get("GOOGLE_CHAT_WEBHOOK", "")
 
 
 def fetch_json(url, timeout=15):
-    """Fetch a URL and return parsed JSON, or None on failure."""
+    """Fetch a URL and return parsed JSON, or {'_error': msg} on failure."""
     try:
         req = Request(url, headers=HEADERS)
         with urlopen(req, timeout=timeout) as resp:
@@ -46,30 +61,51 @@ def fetch_page_text(url, timeout=15):
         })
         with urlopen(req, timeout=timeout) as resp:
             return resp.read().decode()
-    except (URLError, TimeoutError) as e:
+    except (URLError, TimeoutError):
         return None
 
 
-def check_pi4():
-    """Check the Pi4 ingest health endpoint via Tailscale."""
-    data = fetch_json(PI4_HEALTH)
+def check_ingest():
+    """Check the miniserver ais-ingest /health (radio decode → forwarder buffer)."""
+    data = fetch_json(INGEST_HEALTH)
     if data is None or "_error" in (data or {}):
-        return "unreachable", f"Pi4 unreachable: {data.get('_error', 'no response') if data else 'no response'}"
+        msg = data.get("_error", "no response") if data else "no response"
+        return "unreachable", f"ais-ingest unreachable: {msg}"
 
     status = data.get("status", "unknown")
     local_age = data.get("local_age_s")
-    aishub_age = data.get("aishub_age_s")
+    buffered = data.get("buffered")
     issues = data.get("issues")
 
     if status == "ok":
-        return "ok", f"Healthy (local: {local_age}s, aishub: {aishub_age}s)"
-    else:
-        return "degraded", f"Degraded: {', '.join(issues or [])} (local: {local_age}s, aishub: {aishub_age}s)"
+        return "ok", f"Healthy (local: {local_age}s, buffered: {buffered})"
+    return "degraded", f"Degraded: {', '.join(issues or [])} (local: {local_age}s, buffered: {buffered})"
 
 
-def check_aiscatcher(pi4_reachable):
+def check_api_public():
+    """Check ais-api /health via the public Cloudflare tunnel.
+
+    Exercises Cloudflare → cloudflared → ais-api → Postgres in one call —
+    the most important external-facing path.
+    """
+    data = fetch_json(API_HEALTH_PUBLIC)
+    if data is None or "_error" in (data or {}):
+        msg = data.get("_error", "no response") if data else "no response"
+        return "unreachable", f"api.saurabhn.com unreachable: {msg}"
+
+    status = data.get("status", "unknown")
+    db_ok = data.get("db_ok")
+    age = data.get("last_ingest_age_s")
+    latest = data.get("latest_rows")
+    issues = data.get("issues")
+
+    if status == "ok" and db_ok:
+        return "ok", f"Healthy (last ingest: {age}s, {latest:,} latest rows)"
+    return "degraded", f"Degraded: db_ok={db_ok}, issues={issues}, age={age}s"
+
+
+def check_aiscatcher(ingest_reachable):
     """Check AIS-catcher community station monitor API."""
-    # Try JSON API first
     data = fetch_json(AISCATCHER_MONITOR)
     if data is not None and "_error" not in data:
         online = data.get("online", False)
@@ -80,24 +116,22 @@ def check_aiscatcher(pi4_reachable):
 
         if online:
             return "ok", f"Online, {ships} ships, {messages} msgs, last {ago:.0f}s ago"
-        else:
-            return "offline", f"Station offline (last seen {ago}s ago)"
+        return "offline", f"Station offline (last seen {ago}s ago)"
 
-    # Fallback: scrape the station page
+    # Fallback: scrape station page
     print("  ↳ API blocked, scraping page...")
     html = fetch_page_text("https://www.aiscatcher.org/station/3122")
     if html is not None and "Just a moment" not in html and "Attention Required" not in html:
         import re
         if re.search(r'"active"|Active', html):
             return "ok", "Station page shows Active"
-        elif re.search(r'"not_active"|Not Connected', html):
+        if re.search(r'"not_active"|Not Connected', html):
             return "offline", "Station page shows Not Connected"
 
-    # Fallback: infer from Pi4 health (AIS-catcher community uses TCP push from same process)
-    if pi4_reachable:
-        return "ok", "Inferred healthy (Pi4 reachable, AIS-catcher process running)"
-    else:
-        return "unknown", "Cannot verify — Cloudflare blocked and Pi4 unreachable"
+    # Last fallback: infer from ais-ingest reachability (catcher pushes to ingest in-process)
+    if ingest_reachable:
+        return "ok", "Inferred healthy (ais-ingest reachable, catcher feeds it)"
+    return "unknown", "Cannot verify — Cloudflare blocked and ais-ingest unreachable"
 
 
 def check_aishub():
@@ -112,40 +146,34 @@ def check_aishub():
     if not counts:
         return "no_data", "Empty count array from AISHub"
 
-    # Check last 6 entries (30 min at 5-min intervals)
     recent = [c for c in counts[-6:] if c is not None]
     if recent:
         return "ok", f"Active, latest: {recent[-1]} ships, {len(recent)}/6 recent slots"
-    else:
-        return "inactive", "Last 30min all nulls — station not feeding AISHub"
+    return "inactive", "Last 30min all nulls — station not feeding AISHub"
 
 
 def check_aisfriends(aishub_ok):
     """Check AISfriends station stats API."""
-    # Try JSON API first
     data = fetch_json(AISFRIENDS_STATS)
     if data is not None and "_error" not in data:
         vessels = data.get("vessels_count", 0)
         uptime = data.get("uptime", 0)
-
         if vessels > 0:
             return "ok", f"{vessels} vessels, {uptime}% uptime"
-        else:
-            return "inactive", f"0 vessels on AISfriends (uptime: {uptime}%)"
+        return "inactive", f"0 vessels on AISfriends (uptime: {uptime}%)"
 
     # Cloudflare blocks direct access — infer from AISHub (both use UDP from same source)
     if aishub_ok:
         return "ok", "Inferred healthy (AISHub UDP feed active, same source)"
-    else:
-        return "unknown", "Cannot verify — Cloudflare blocked and AISHub feed is down"
+    return "unknown", "Cannot verify — Cloudflare blocked and AISHub feed is down"
 
 
 def fetch_docker_logs(container, lines=20):
-    """SSH into Pi4 via Tailscale and fetch Docker container logs."""
+    """SSH into miniserver via Tailscale and fetch Docker container logs."""
     try:
         result = subprocess.run(
             ["ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
-             f"extremo@{PI4_IP}",
+             f"{MINISERVER_USER}@{MINISERVER_IP}",
              f"docker logs --tail {lines} {container} 2>&1"],
             capture_output=True, text=True, timeout=20,
         )
@@ -155,19 +183,37 @@ def fetch_docker_logs(container, lines=20):
 
 
 def check_docker_errors():
-    """Check Docker logs for Python errors/exceptions in the last hour."""
+    """Scan Docker logs across all stack containers for errors in the last hour."""
+    # `recv() error 0 (Success)` is a benign AIS-catcher log line, not a real error.
+    # `forwarder transient error` was demoted to warning but may still appear.
+    grep_cmd = (
+        "for c in " + " ".join(LOG_CONTAINERS) + "; do "
+        "  echo \"=== $c ===\"; "
+        "  docker logs --since 1h $c 2>&1 "
+        "    | grep -iE 'Error|Exception|Traceback|Failed' "
+        "    | grep -vE 'recv\\(\\)|forwarder transient' "
+        "    | tail -10; "
+        "done"
+    )
     try:
         result = subprocess.run(
             ["ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
-             f"extremo@{PI4_IP}",
-             "docker logs --since 1h ais-ingest 2>&1 | grep -iE 'Error|Exception|Traceback|Failed' | grep -v 'recv()' | tail -10"],
-            capture_output=True, text=True, timeout=20,
+             f"{MINISERVER_USER}@{MINISERVER_IP}", grep_cmd],
+            capture_output=True, text=True, timeout=30,
         )
-        errors = result.stdout.strip()
-        if not errors:
-            return "ok", "No errors in last hour"
-        error_count = len(errors.splitlines())
-        return "errors", f"{error_count} errors in last hour:\n{errors}"
+        out = result.stdout.strip()
+        # Strip out empty container blocks (just the === header with nothing after)
+        blocks = []
+        for block in out.split("=== ")[1:]:
+            name, _, body = block.partition("\n")
+            body = body.strip()
+            if body:
+                blocks.append(f"=== {name}\n{body}")
+        if not blocks:
+            return "ok", "No errors in last hour across stack"
+        joined = "\n".join(blocks)
+        n = sum(len(b.splitlines()) - 1 for b in blocks)
+        return "errors", f"{n} error line(s) in last hour:\n{joined}"
     except (subprocess.TimeoutExpired, Exception) as e:
         return "unknown", f"Could not check logs: {e}"
 
@@ -203,45 +249,46 @@ def main():
     results = {}
     any_failed = False
 
-    # Run checks in order — AISfriends depends on Pi4 health result
-    results["Pi4 Health"] = check_pi4()
+    # 1. Local radio decode → forwarder buffer
+    results["ais-ingest"] = check_ingest()
+    ingest_reachable = results["ais-ingest"][0] in ("ok", "degraded")
+
+    # 2. ais-api via public Cloudflare tunnel — exercises full external path
+    results["ais-api (public)"] = check_api_public()
+
+    # 3. Downstream feeds
     results["AISHub"] = check_aishub()
-
-    # AIS-catcher: try API/scrape, fall back to inferring from Pi4 local data
-    pi4_reachable = results["Pi4 Health"][0] in ("ok", "degraded")
-    results["AIS-catcher"] = check_aiscatcher(pi4_reachable)
-
-    # AISfriends: infer from AISHub if Cloudflare blocks (both use UDP from same source)
+    results["AIS-catcher"] = check_aiscatcher(ingest_reachable)
     aishub_ok = results["AISHub"][0] == "ok"
     results["AISfriends"] = check_aisfriends(aishub_ok)
 
-    # Check Docker logs for Python errors
+    # 4. Docker error scan across the whole stack
     results["App Errors"] = check_docker_errors()
 
     for name, (status, message) in results.items():
         is_ok = status == "ok"
-        icon = "✅" if status == "ok" else "⚠️" if "Cloudflare" in message else "❌"
+        icon = "✅" if is_ok else "⚠️" if "Cloudflare" in message else "❌"
         print(f"{icon} {name}: {status} — {message}")
         if not is_ok:
             any_failed = True
 
-    # Check TS key
+    # Tailscale key
     ts_status, ts_msg = check_ts_key_expiry()
     if ts_status != "ok":
         print(f"🔑 Tailscale: {ts_msg}")
         any_failed = True
 
-    # Always fetch Docker logs via SSH
-    print("\nFetching Docker logs from Pi4...")
+    # Always pull recent Docker logs for visibility
+    print("\nFetching Docker logs from miniserver...")
     docker_logs = {}
-    for container in ("ais-ingest", "ais-catcher"):
+    for container in LOG_CONTAINERS:
         logs = fetch_docker_logs(container)
         docker_logs[container] = logs
         print(f"--- {container} ---\n{logs}\n")
 
-    # Send alert if anything failed
+    # Alert on failure
     if any_failed:
-        alert = ["🚨 *AIS Station Alert*\n"]
+        alert = ["🚨 *AIS Stack Alert*\n"]
         for name, (status, message) in results.items():
             alert.append(f"*{name}:* {status} — {message}")
         if ts_status != "ok":
