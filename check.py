@@ -184,14 +184,21 @@ def fetch_docker_logs(container, lines=20):
 
 def check_docker_errors():
     """Scan Docker logs across all stack containers for errors in the last hour."""
-    # `recv() error 0 (Success)` is a benign AIS-catcher log line, not a real error.
-    # `forwarder transient error` was demoted to warning but may still appear.
+    # Benign noise we don't want to alert on:
+    #   recv() error 0 (Success)             — ais-catcher idle keep-alive blip
+    #   send error <N> (Connection reset)    — ais-catcher TCP forward to a
+    #                                           remote feed (AISHub etc.) that
+    #                                           occasionally resets the conn;
+    #                                           catcher reconnects and continues
+    #   forwarder transient error            — ingest forwarder's HTTP retries
+    #                                           during ais-api redeploys
+    benign = "recv\\(\\)|send error [0-9]+|forwarder transient"
     grep_cmd = (
         "for c in " + " ".join(LOG_CONTAINERS) + "; do "
         "  echo \"=== $c ===\"; "
         "  docker logs --since 1h $c 2>&1 "
-        "    | grep -iE 'Error|Exception|Traceback|Failed' "
-        "    | grep -vE 'recv\\(\\)|forwarder transient' "
+        f"    | grep -iE 'Error|Exception|Traceback|Failed' "
+        f"    | grep -vE '{benign}' "
         "    | tail -10; "
         "done"
     )
