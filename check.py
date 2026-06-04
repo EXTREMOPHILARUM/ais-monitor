@@ -134,8 +134,22 @@ def check_aiscatcher(ingest_reachable):
     return "unknown", "Cannot verify — Cloudflare blocked and ais-ingest unreachable"
 
 
+# AISHub's daily-statistics backfills in bursts — even a healthy feed leaves
+# strings of recent null slots that fill in retroactively (observed gaps up to
+# ~50min). So "N of last 6 slots" flaps; we instead alert only when the most
+# recent populated *past* slot is older than this many minutes.
+AISHUB_STALE_MIN = 90
+
+
 def check_aishub():
-    """Check AISHub daily statistics — empty or trailing nulls means offline."""
+    """Check AISHub daily statistics — stale latest *past* slot means offline.
+
+    `count` is a fixed 24h window of 5-min slots aligned to `labels` (unix ts).
+    Trailing entries are *future* slots (always null), and AISHub backfills
+    recent past slots in bursts, so the literal tail says nothing. We measure
+    minutes since the most recent non-null slot whose label is already in the
+    past, and alert only past AISHUB_STALE_MIN.
+    """
     data = fetch_json(AISHUB_DAILY)
     if data is None:
         return "no_data", "No data from AISHub (station may be offline)"
@@ -146,10 +160,25 @@ def check_aishub():
     if not counts:
         return "no_data", "Empty count array from AISHub"
 
-    recent = [c for c in counts[-6:] if c is not None]
-    if recent:
-        return "ok", f"Active, latest: {recent[-1]} ships, {len(recent)}/6 recent slots"
-    return "inactive", "Last 30min all nulls — station not feeding AISHub"
+    labels = data.get("labels", [])
+    now = datetime.now(timezone.utc).timestamp()
+    if labels and len(labels) == len(counts):
+        past = [(t, c) for t, c in zip(labels, counts) if t <= now and c is not None]
+    else:
+        # No usable labels — fall back to the last non-null entry, age unknown.
+        nz = [c for c in counts if c is not None]
+        if nz:
+            return "ok", f"Active, latest: {nz[-1]} ships (no slot timestamps)"
+        return "inactive", "All slots null — station not feeding AISHub"
+
+    if not past:
+        return "inactive", "No populated slots today — station not feeding AISHub"
+
+    last_t, last_v = past[-1]
+    age_min = (now - last_t) / 60
+    if age_min <= AISHUB_STALE_MIN:
+        return "ok", f"Active, latest: {last_v} ships, {age_min:.0f}min ago"
+    return "inactive", f"Last feed {age_min:.0f}min ago (>{AISHUB_STALE_MIN}min) — station not feeding AISHub"
 
 
 def check_aisfriends(aishub_ok):
@@ -183,21 +212,34 @@ def fetch_docker_logs(container, lines=20):
 
 
 def check_docker_errors():
-    """Scan Docker logs across all stack containers for errors in the last hour."""
-    # Benign noise we don't want to alert on:
-    #   recv() error 0 (Success)             — ais-catcher idle keep-alive blip
-    #   send error <N> (Connection reset)    — ais-catcher TCP forward to a
-    #                                           remote feed (AISHub etc.) that
-    #                                           occasionally resets the conn;
-    #                                           catcher reconnects and continues
-    #   forwarder transient error            — ingest forwarder's HTTP retries
-    #                                           during ais-api redeploys
-    benign = "recv\\(\\)|send error [0-9]+|forwarder transient"
+    """Scan Docker logs across all stack containers for errors in the last hour.
+
+    Matches *structured* ERROR/CRITICAL/FATAL log-level events, not any line
+    mentioning "error". Both Python services log `%(asctime)s %(levelname)s
+    %(name)s: %(message)s`, so the level field is space-delimited (` ERROR `).
+    Grepping the level field (rather than the old keyword grep) means a single
+    `logger.exception` produces ONE matched line — its message — instead of the
+    whole traceback body leaking orphaned `Traceback`/`...Error:` fragments that
+    can never be cleanly filtered. ais-catcher's plain-text blips have no level
+    field and are covered by the dedicated AIS-catcher / ais-ingest checks.
+    """
+    # Benign — structured ERROR events that are transient *by design*; the
+    # condition each reflects is already covered by a dedicated check above, so
+    # this scan stays focused on genuine app-level faults:
+    #   forwarder send failed   — ingest outbox retry+backoff while ais-api is
+    #                             restarting (expected on every ais-api redeploy;
+    #                             ais-api reachability is the `ais-api` check)
+    benign = "forwarder send failed"
+    # `--tail` before `--since` so docker reads from the end of the json-file
+    # logs instead of scanning the whole (up-to-300MB) file from the start —
+    # ais-catcher's per-message firehose otherwise blows past the SSH timeout.
+    # 20k lines comfortably covers >1h for every container; --since still caps
+    # the window to the last hour.
     grep_cmd = (
         "for c in " + " ".join(LOG_CONTAINERS) + "; do "
         "  echo \"=== $c ===\"; "
-        "  docker logs --since 1h $c 2>&1 "
-        f"    | grep -iE 'Error|Exception|Traceback|Failed' "
+        "  docker logs --tail 20000 --since 1h $c 2>&1 "
+        f"    | grep -E ' (ERROR|CRITICAL|FATAL) ' "
         f"    | grep -vE '{benign}' "
         "    | tail -10; "
         "done"
@@ -206,7 +248,7 @@ def check_docker_errors():
         result = subprocess.run(
             ["ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
              f"{MINISERVER_USER}@{MINISERVER_IP}", grep_cmd],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=90,
         )
         out = result.stdout.strip()
         # Strip out empty container blocks (just the === header with nothing after)
