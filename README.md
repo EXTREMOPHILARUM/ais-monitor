@@ -1,24 +1,29 @@
 # AIS Stack Monitor
 
-GitHub Actions-based monitoring for the AIS stack on the **miniserver**
-(Tailscale `100.86.157.26`). Runs hourly, connects via Tailscale, and sends
-Google Chat alerts on failure.
+GitHub Actions-based monitoring for the AIS stack, which spans **two hosts**.
+Runs hourly, connects via Tailscale, and sends Google Chat alerts on failure.
 
-> **Note:** The Pi4 was retired in April 2026 after the RTL-SDR was moved
-> to the miniserver. All checks now target the consolidated miniserver
-> stack: `ais-catcher`, `ais-ingest`, `ais-api`, `ais-postgres`,
-> `ais-cloudflared`.
+| Host | Tailscale | Runs |
+|------|-----------|------|
+| **pi5** | `100.69.37.64` | `ais-catcher` (RTL-SDR decode), `ais-ingest`, `ais-autoheal` |
+| **invoicebuddy** | `100.81.76.63` | `ais-api`, `ais-postgres`, `ais-redis`, celery worker/beat, `ais-cloudflared` |
+
+> **Note:** as of **2026-08-16** the miniserver is out of the data path and is
+> no longer monitored. `ais-api` moved to invoicebuddy (restored from the
+> Backblaze B2 backups) and the RTL-SDR moved from the miniserver to a new
+> Pi 5. Before that the whole stack was consolidated on the miniserver; before
+> April 2026 the receiver was a Pi 4.
 
 ## What it checks
 
 | Check | Method | Fallback |
 |-------|--------|----------|
-| **ais-ingest** | Direct HTTP via Tailscale (`http://100.86.157.26:9123/health`) | — |
-| **ais-api (public)** | HTTPS to `https://api.saurabhn.com/health` — exercises Cloudflare → cloudflared → ais-api → Postgres | — |
+| **ais-ingest** | Direct HTTP via Tailscale (`http://100.69.37.64:9123/health`) — pi5 | — |
+| **ais-api (public)** | HTTPS to `https://api.saurabhn.com/health` — exercises Cloudflare → cloudflared → ais-api → Postgres | Direct tailnet hit at `http://100.81.76.63:9200/health` to separate a tunnel fault from an app fault |
 | **AISHub** | JSON API (`/station/2387/daily-statistics.json`) | — |
 | **AIS-catcher** | JSON API → page scrape | Inferred from `ais-ingest` reachability |
 | **AISfriends** | JSON API | Inferred from AISHub (same UDP source) |
-| **App Errors** | SSH into miniserver, scan Docker logs across `ais-catcher`, `ais-ingest`, `ais-api` for errors in last hour | — |
+| **App Errors** | SSH into **both** hosts, scan Docker logs (`ais-catcher`, `ais-ingest` on pi5; `ais-api`, `ais-celery-worker` on invoicebuddy) for errors in last hour | Unreachable host reported as `unknown` |
 | **Tailscale key** | Days until expiry | Alerts 7 days before |
 
 AIS-catcher and AISfriends are behind Cloudflare, which blocks API/scrape
@@ -29,8 +34,8 @@ AISfriends is too (same UDP from the same process).
 ## On failure
 
 When any check fails:
-- Recent Docker logs from `ais-catcher`, `ais-ingest`, and `ais-api` are
-  fetched via Tailscale SSH
+- Recent Docker logs from all four monitored containers, across both hosts,
+  are fetched via Tailscale SSH (labelled `host/container`)
 - All results + logs are sent as a Google Chat notification
 
 Docker logs are always fetched (even on success) and printed to the
@@ -46,16 +51,22 @@ GitHub Actions log for debugging.
 
 ## App error scanning
 
-The monitor SSHes into the miniserver and scans `docker logs --since 1h`
-across the stack containers for: `Error`, `Exception`, `Traceback`,
-`Failed`. Excluded as known-benign:
+The monitor SSHes into **both** hosts and scans `docker logs --since 1h` for
+*structured* log-level events — the space-delimited ` ERROR `/` CRITICAL `/
+` FATAL ` field — rather than any line containing the word "error". That way a
+single `logger.exception` yields one matched line instead of leaking traceback
+fragments. Excluded as known-benign:
 
-- `recv() error 0 (Success)` — AIS-catcher's harmless TCP reset chatter
-- `forwarder transient error` — already demoted to warning; appears on
-  brief connection blips during ais-api redeploys
+- `forwarder send failed` — the ingest outbox retrying with backoff while
+  ais-api restarts; expected on every redeploy, and ais-api reachability has
+  its own check.
 
-This catches Postgres failures, schema migration errors, R2 upload
-failures, type mismatches, unhandled Python exceptions, and similar.
+`ais-celery-worker` is scanned because the nightly Postgres backup to
+Backblaze B2 runs there — a failing backup would otherwise be silent.
+
+This catches Postgres failures, backup failures, unhandled exceptions and
+similar. If a host cannot be reached the check reports `unknown` and alerts;
+it never reports healthy for a host it could not scan.
 
 ## Setup
 
@@ -68,8 +79,9 @@ failures, type mismatches, unhandled Python exceptions, and similar.
 
 ### Tailscale ACL
 
-The ACL needs `tag:ci` plus an SSH accept rule so the GitHub runner can
-SSH into the miniserver for Docker log scraping:
+The ACL needs `tag:ci` plus an SSH accept rule so the GitHub runner can SSH
+into both hosts for Docker log scraping. `dst: autogroup:self` covers every
+device this account owns, so adding hosts needs no ACL change:
 
 ```jsonc
 "tagOwners": {
@@ -87,13 +99,18 @@ SSH into the miniserver for Docker log scraping:
 ],
 ```
 
-### Tailscale SSH on miniserver
+### Tailscale SSH on each host
 
-Enable Tailscale SSH on the miniserver:
+Every monitored host needs Tailscale SSH enabled, or its log scan fails:
 
 ```bash
 sudo tailscale set --ssh
 ```
+
+Check with `tailscale debug prefs | grep RunSSH`. Note that running this while
+connected over Tailscale drops the current session (it reroutes port 22 to
+Tailscale SSH) — it will refuse unless you pass `--accept-risk=lose-ssh`. Make
+sure you have another way in before doing that on a remote host.
 
 ### Local testing
 
@@ -107,5 +124,6 @@ GOOGLE_CHAT_WEBHOOK="https://chat.googleapis.com/..." python3 check.py
 
 ## Related
 
-- [EXTREMOPHILARUM/ais-station](https://github.com/EXTREMOPHILARUM/ais-station) — local radio decode + forwarder
+- [EXTREMOPHILARUM/ais-station](https://github.com/EXTREMOPHILARUM/ais-station) — local radio decode + forwarder (runs on pi5)
+- [EXTREMOPHILARUM/ais-api](https://github.com/EXTREMOPHILARUM/ais-api) — API + Postgres + AISHub poller (runs on invoicebuddy)
 - [EXTREMOPHILARUM/ais-api](https://github.com/EXTREMOPHILARUM/ais-api) — FastAPI + Postgres serve layer

@@ -1,13 +1,23 @@
 """AIS station + API monitor.
 
-Watches the consolidated stack on the miniserver:
-- ais-catcher (RTL-SDR decode)
-- ais-ingest (local-radio buffer + forwarder)
-- ais-api (FastAPI serve, Postgres-backed) via the public Cloudflare tunnel
-- AISHub / AISfriends / AIS-catcher community feeds (downstream visibility)
+Watches a stack split across two hosts:
 
-The Pi4 is no longer in the loop — RTL-SDR was moved to the miniserver after
-the Pi died. All checks now target miniserver (Tailscale 100.86.157.26).
+- **pi5** (Tailscale 100.69.37.64) — the receiver.
+  ais-catcher (RTL-SDR decode), ais-ingest (dedup + forwarder outbox), autoheal.
+- **invoicebuddy** (Tailscale 100.81.76.63) — the serving layer.
+  ais-api (FastAPI + Postgres + in-process AISHub poller), celery worker/beat,
+  cloudflared. Public at https://api.saurabhn.com.
+- AISHub / AISfriends / AIS-catcher community feeds (downstream visibility).
+
+History: everything ran on the miniserver until 2026-08-16, when ais-api moved
+to invoicebuddy and the RTL-SDR moved to a new Pi 5. The miniserver is no longer
+in the data path and is not checked.
+
+Both hosts are reached over Tailscale SSH. The existing ACL rule grants tag:ci
+`dst: autogroup:self`, which covers any device this account owns, so no ACL
+change was needed for the new hosts — but each host must have Tailscale SSH
+enabled (`tailscale set --ssh`). A host we cannot reach is reported as
+`unknown`, never as a false "healthy".
 """
 
 import json
@@ -18,10 +28,15 @@ from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-MINISERVER_IP = "100.86.157.26"
-MINISERVER_USER = "extremo"
-INGEST_HEALTH = f"http://{MINISERVER_IP}:9123/health"
+SSH_USER = "extremo"
+PI5_IP = "100.69.37.64"           # receiver: ais-catcher + ais-ingest
+INVOICEBUDDY_IP = "100.81.76.63"  # serving: ais-api + Postgres + celery
+
+INGEST_HEALTH = f"http://{PI5_IP}:9123/health"
 API_HEALTH_PUBLIC = "https://api.saurabhn.com/health"
+# Direct tailnet hit at ais-api, bypassing Cloudflare. Lets us tell "the API is
+# down" apart from "the tunnel is down" when the public check fails.
+API_HEALTH_DIRECT = f"http://{INVOICEBUDDY_IP}:9200/health"
 AISCATCHER_MONITOR = "https://www.aiscatcher.org/api/station/monitor?id=3122"
 AISHUB_DAILY = "https://www.aishub.net/station/2387/daily-statistics.json"
 AISFRIENDS_STATS = "https://www.aisfriends.com/station-stats/869?station_only=1"
@@ -32,10 +47,15 @@ HEADERS = {
     "User-Agent": "AIS-Monitor/1.0",
 }
 
-# Containers we check Docker logs for — all on the miniserver now.
-LOG_CONTAINERS = ("ais-catcher", "ais-ingest", "ais-api")
+# Containers to scan Docker logs for, per host. Keys are (label, tailscale ip).
+# celery-worker is included because the nightly pg_backup to Backblaze B2 runs
+# there — a failing backup is otherwise silent.
+LOG_TARGETS = {
+    ("pi5", PI5_IP): ("ais-catcher", "ais-ingest"),
+    ("invoicebuddy", INVOICEBUDDY_IP): ("ais-api", "ais-celery-worker"),
+}
 
-TS_KEY_EXPIRY = os.environ.get("TS_KEY_EXPIRY", "2026-06-21")
+TS_KEY_EXPIRY = os.environ.get("TS_KEY_EXPIRY", "2026-09-20")  # workflow overrides; keep in sync
 GOOGLE_CHAT_WEBHOOK = os.environ.get("GOOGLE_CHAT_WEBHOOK", "")
 
 
@@ -66,7 +86,7 @@ def fetch_page_text(url, timeout=15):
 
 
 def check_ingest():
-    """Check the miniserver ais-ingest /health (radio decode → forwarder buffer)."""
+    """Check pi5 ais-ingest /health (radio decode → dedup → forwarder outbox)."""
     data = fetch_json(INGEST_HEALTH)
     if data is None or "_error" in (data or {}):
         msg = data.get("_error", "no response") if data else "no response"
@@ -91,6 +111,16 @@ def check_api_public():
     data = fetch_json(API_HEALTH_PUBLIC)
     if data is None or "_error" in (data or {}):
         msg = data.get("_error", "no response") if data else "no response"
+        # Retry straight at ais-api over the tailnet. If that answers, the app
+        # is fine and the fault is Cloudflare/cloudflared — a materially
+        # different page to wake up for.
+        direct = fetch_json(API_HEALTH_DIRECT, timeout=10)
+        if direct is not None and "_error" not in direct:
+            return "degraded", (
+                f"Tunnel down but ais-api healthy on the tailnet "
+                f"(public: {msg}; direct status={direct.get('status')}) — "
+                "check cloudflared on invoicebuddy"
+            )
         return "unreachable", f"api.saurabhn.com unreachable: {msg}"
 
     status = data.get("status", "unknown")
@@ -197,12 +227,12 @@ def check_aisfriends(aishub_ok):
     return "unknown", "Cannot verify — Cloudflare blocked and AISHub feed is down"
 
 
-def fetch_docker_logs(container, lines=20):
-    """SSH into miniserver via Tailscale and fetch Docker container logs."""
+def fetch_docker_logs(host_ip, container, lines=20):
+    """SSH to a host over Tailscale and fetch one container's recent logs."""
     try:
         result = subprocess.run(
             ["ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
-             f"{MINISERVER_USER}@{MINISERVER_IP}",
+             f"{SSH_USER}@{host_ip}",
              f"docker logs --tail {lines} {container} 2>&1"],
             capture_output=True, text=True, timeout=20,
         )
@@ -230,41 +260,54 @@ def check_docker_errors():
     #                             restarting (expected on every ais-api redeploy;
     #                             ais-api reachability is the `ais-api` check)
     benign = "forwarder send failed"
-    # `--tail` before `--since` so docker reads from the end of the json-file
-    # logs instead of scanning the whole (up-to-300MB) file from the start —
-    # ais-catcher's per-message firehose otherwise blows past the SSH timeout.
-    # 20k lines comfortably covers >1h for every container; --since still caps
-    # the window to the last hour.
-    grep_cmd = (
-        "for c in " + " ".join(LOG_CONTAINERS) + "; do "
-        "  echo \"=== $c ===\"; "
-        "  docker logs --tail 20000 --since 1h $c 2>&1 "
-        f"    | grep -E ' (ERROR|CRITICAL|FATAL) ' "
-        f"    | grep -vE '{benign}' "
-        "    | tail -10; "
-        "done"
-    )
-    try:
-        result = subprocess.run(
-            ["ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
-             f"{MINISERVER_USER}@{MINISERVER_IP}", grep_cmd],
-            capture_output=True, text=True, timeout=90,
+    blocks = []
+    unreachable = []
+
+    for (label, host_ip), containers in LOG_TARGETS.items():
+        # `--tail` before `--since` so docker reads from the end of the json-file
+        # logs instead of scanning the whole (up-to-300MB) file from the start —
+        # ais-catcher's per-message firehose otherwise blows past the SSH timeout.
+        # 20k lines comfortably covers >1h for every container; --since still caps
+        # the window to the last hour.
+        grep_cmd = (
+            "for c in " + " ".join(containers) + "; do "
+            "  echo \"=== $c ===\"; "
+            "  docker logs --tail 20000 --since 1h $c 2>&1 "
+            f"    | grep -E ' (ERROR|CRITICAL|FATAL) ' "
+            f"    | grep -vE '{benign}' "
+            "    | tail -10; "
+            "done"
         )
-        out = result.stdout.strip()
-        # Strip out empty container blocks (just the === header with nothing after)
-        blocks = []
-        for block in out.split("=== ")[1:]:
-            name, _, body = block.partition("\n")
-            body = body.strip()
-            if body:
-                blocks.append(f"=== {name}\n{body}")
-        if not blocks:
-            return "ok", "No errors in last hour across stack"
-        joined = "\n".join(blocks)
-        n = sum(len(b.splitlines()) - 1 for b in blocks)
-        return "errors", f"{n} error line(s) in last hour:\n{joined}"
-    except (subprocess.TimeoutExpired, Exception) as e:
-        return "unknown", f"Could not check logs: {e}"
+        try:
+            result = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
+                 f"{SSH_USER}@{host_ip}", grep_cmd],
+                capture_output=True, text=True, timeout=90,
+            )
+            if result.returncode != 0 and not result.stdout.strip():
+                unreachable.append(f"{label}: {result.stderr.strip()[:120] or 'ssh failed'}")
+                continue
+            # Drop empty container blocks (a === header with nothing under it).
+            for block in result.stdout.strip().split("=== ")[1:]:
+                name, _, body = block.partition("\n")
+                body = body.strip()
+                if body:
+                    blocks.append(f"=== {label}/{name}\n{body}")
+        except (subprocess.TimeoutExpired, Exception) as e:
+            unreachable.append(f"{label}: {e}")
+
+    # An unreachable host is reported, never silently treated as healthy — a
+    # host we cannot scan is exactly when we most want to know.
+    if unreachable:
+        detail = "; ".join(unreachable)
+        if blocks:
+            return "errors", f"Could not scan {detail}\n" + "\n".join(blocks)
+        return "unknown", f"Could not check logs — {detail}"
+
+    if not blocks:
+        return "ok", "No errors in last hour across both hosts"
+    n = sum(len(b.splitlines()) - 1 for b in blocks)
+    return "errors", f"{n} error line(s) in last hour:\n" + "\n".join(blocks)
 
 
 def check_ts_key_expiry():
@@ -328,12 +371,13 @@ def main():
         any_failed = True
 
     # Always pull recent Docker logs for visibility
-    print("\nFetching Docker logs from miniserver...")
+    print("\nFetching Docker logs from pi5 + invoicebuddy...")
     docker_logs = {}
-    for container in LOG_CONTAINERS:
-        logs = fetch_docker_logs(container)
-        docker_logs[container] = logs
-        print(f"--- {container} ---\n{logs}\n")
+    for (label, host_ip), containers in LOG_TARGETS.items():
+        for container in containers:
+            logs = fetch_docker_logs(host_ip, container)
+            docker_logs[f"{label}/{container}"] = logs
+            print(f"--- {label}/{container} ---\n{logs}\n")
 
     # Alert on failure
     if any_failed:
