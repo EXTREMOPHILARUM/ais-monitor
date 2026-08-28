@@ -85,6 +85,33 @@ def fetch_page_text(url, timeout=15):
         return None
 
 
+def human_age(seconds):
+    """Render a duration the way a half-awake operator reads it: 54m, not 3225s.
+
+    The 2026-08-19 outage paged correctly at 08:35 with `local stale (3225s)`
+    and was still missed — seconds past about a minute do not register as a
+    duration at a glance. Every age in an alert goes through this.
+    """
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return "unknown"
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+# Which checks observe the station directly, and which only observe someone
+# else's view of it. A failing ROOT check explains every failing derived one, so
+# the alert leads with roots and files the rest as consequences — otherwise the
+# eye lands on whichever line happens to sound most dramatic, which on
+# 2026-08-19 was AISHub's "102min ago" rather than the ais-ingest line that
+# had been failing for an hour and was the actual fault.
+ROOT_CHECKS = ("ais-ingest", "ais-api (public)")
+
+
 def check_ingest():
     """Check pi5 ais-ingest /health (radio decode → dedup → forwarder outbox)."""
     data = fetch_json(INGEST_HEALTH)
@@ -98,8 +125,11 @@ def check_ingest():
     issues = data.get("issues")
 
     if status == "ok":
-        return "ok", f"Healthy (local: {local_age}s, buffered: {buffered})"
-    return "degraded", f"Degraded: {', '.join(issues or [])} (local: {local_age}s, buffered: {buffered})"
+        return "ok", f"Healthy (local: {human_age(local_age)}, buffered: {buffered})"
+    return "degraded", (
+        f"NO LOCAL DECODE for {human_age(local_age)} — the radio has stopped. "
+        f"({', '.join(issues or [])}; buffered: {buffered})"
+    )
 
 
 def check_api_public():
@@ -208,7 +238,9 @@ def check_aishub():
     age_min = (now - last_t) / 60
     if age_min <= AISHUB_STALE_MIN:
         return "ok", f"Active, latest: {last_v} ships, {age_min:.0f}min ago"
-    return "inactive", f"Last feed {age_min:.0f}min ago (>{AISHUB_STALE_MIN}min) — station not feeding AISHub"
+    return "inactive", (
+        f"Last feed {age_min:.0f}min ago (>{AISHUB_STALE_MIN}min) — station not feeding AISHub"
+    )
 
 
 def check_aisfriends(aishub_ok):
@@ -379,15 +411,68 @@ def main():
             docker_logs[f"{label}/{container}"] = logs
             print(f"--- {label}/{container} ---\n{logs}\n")
 
-    # Alert on failure
+    # Alert on failure.
+    #
+    # Structure matters more than content here. The 2026-08-19 outage paged on
+    # time, with ais-ingest already the first line — and was still missed,
+    # because the headline was a generic "AIS Stack Alert", the age read
+    # "3225s", and six checks plus four log dumps followed at equal weight. So:
+    # the headline names the specific fault, root causes lead, and derived
+    # symptoms are explicitly labelled as consequences rather than competing
+    # for attention with the thing that actually broke.
     if any_failed:
-        alert = ["🚨 *AIS Stack Alert*\n"]
-        for name, (status, message) in results.items():
-            alert.append(f"*{name}:* {status} — {message}")
+        failed = {n: r for n, r in results.items() if r[0] != "ok"}
+        root_failed = [n for n in failed if n in ROOT_CHECKS]
+        derived_failed = [n for n in failed if n not in ROOT_CHECKS]
+
+        # Headline = the most important single fact. A root failure outranks any
+        # number of downstream ones; they are usually just its shadow.
+        if root_failed:
+            lead = root_failed[0]
+            headline = f"🚨 *{lead}* — {failed[lead][1]}"
+        elif derived_failed:
+            lead = derived_failed[0]
+            headline = f"⚠️ *{lead}* — {failed[lead][1]}"
+        else:
+            headline = "🔑 *AIS stack* — attention needed"
+
+        alert = [headline, ""]
+
+        if root_failed:
+            alert.append("*Root cause candidates* (checked directly at the source):")
+            for name in root_failed:
+                alert.append(f"• *{name}:* {failed[name][1]}")
+            alert.append("")
+
+        if derived_failed:
+            note = (
+                " — likely downstream of the above, not separate faults"
+                if root_failed else ""
+            )
+            alert.append(f"*Downstream / third-party views*{note}:")
+            for name in derived_failed:
+                alert.append(f"• *{name}:* {failed[name][1]}")
+            alert.append("")
+
+        healthy = [n for n, r in results.items() if r[0] == "ok"]
+        if healthy:
+            alert.append(f"_Healthy: {', '.join(healthy)}_")
         if ts_status != "ok":
             alert.append(f"*Tailscale:* {ts_msg}")
 
+        # Only attach logs for hosts that actually have a failing check. Four
+        # unconditional log dumps is what buried the signal last time.
+        implicated = set()
+        if "ais-ingest" in failed or "AIS-catcher" in failed:
+            implicated.add("pi5")
+        if "ais-api (public)" in failed:
+            implicated.add("invoicebuddy")
+        if "App Errors" in failed:
+            implicated.update({"pi5", "invoicebuddy"})
+
         for container, logs in docker_logs.items():
+            if container.split("/")[0] not in implicated:
+                continue
             truncated = logs[-500:] if len(logs) > 500 else logs
             alert.append(f"\n*{container} logs (last 20 lines):*\n```\n{truncated}\n```")
 
