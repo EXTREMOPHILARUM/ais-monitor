@@ -84,6 +84,9 @@ keys, so the runner joins as `tag:ci`. Tailscale SSH has no tagged-to-untagged
 rule, which is why pi5 and invoicebuddy carry `tag:ais-host`. The member SSH
 rule lists `tag:ais-host` alongside `autogroup:self` — without it, tagging the
 hosts would cut off your own SSH, since a tag-owned device is no longer "self".
+`nodeAttrs` needs the same treatment for the same reason: `autogroup:member`
+stops covering a tag-owned device, so Funnel is revoked on the tagged hosts
+unless `tag:ais-host` is listed there too.
 
 ```jsonc
 "tagOwners": {
@@ -109,6 +112,10 @@ hosts would cut off your own SSH, since a tag-owned device is no longer "self".
         "dst":    ["tag:ais-host"],
         "users":  ["extremo"],
     },
+],
+
+"nodeAttrs": [
+    {"target": ["autogroup:member", "tag:ais-host"], "attr": ["funnel"]},
 ],
 ```
 
