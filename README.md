@@ -24,7 +24,6 @@ Runs hourly, connects via Tailscale, and sends Google Chat alerts on failure.
 | **AIS-catcher** | JSON API → page scrape | Inferred from `ais-ingest` reachability |
 | **AISfriends** | JSON API | Inferred from AISHub (same UDP source) |
 | **App Errors** | SSH into **both** hosts, scan Docker logs (`ais-catcher`, `ais-ingest` on pi5; `ais-api`, `ais-celery-worker` on invoicebuddy) for errors in last hour | Unreachable host reported as `unknown` |
-| **Tailscale key** | Days until expiry | Alerts 7 days before |
 
 AIS-catcher and AISfriends are behind Cloudflare, which blocks API/scrape
 requests from CI. When blocked, status is inferred: if `ais-ingest` is
@@ -74,12 +73,14 @@ it never reports healthy for a host it could not scan.
 
 | Secret | Description |
 |--------|-------------|
-| `TS_AUTH_KEY` | Tailscale auth key (ephemeral + reusable) |
+| `TS_OAUTH_CLIENT_ID` | Tailscale OAuth client ID (scope `auth_keys`, tag `tag:ci`) |
+| `TS_OAUTH_SECRET` | Tailscale OAuth client secret |
 | `GOOGLE_CHAT_WEBHOOK` | Google Chat incoming webhook URL |
 
 ### Tailscale ACL
 
-The ACL needs `tag:ci` plus an SSH accept rule so the GitHub runner can SSH
+The OAuth client mints an ephemeral key tagged `tag:ci` on each run, so the ACL
+needs `tag:ci` plus an SSH accept rule so the GitHub runner can SSH
 into both hosts for Docker log scraping. `dst: autogroup:self` covers every
 device this account owns, so adding hosts needs no ACL change:
 

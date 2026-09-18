@@ -55,7 +55,6 @@ LOG_TARGETS = {
     ("invoicebuddy", INVOICEBUDDY_IP): ("ais-api", "ais-celery-worker"),
 }
 
-TS_KEY_EXPIRY = os.environ.get("TS_KEY_EXPIRY", "2026-12-18")  # workflow overrides; keep in sync
 GOOGLE_CHAT_WEBHOOK = os.environ.get("GOOGLE_CHAT_WEBHOOK", "")
 
 
@@ -342,18 +341,6 @@ def check_docker_errors():
     return "errors", f"{n} error line(s) in last hour:\n" + "\n".join(blocks)
 
 
-def check_ts_key_expiry():
-    """Check if Tailscale auth key is expiring within 7 days."""
-    try:
-        expiry = datetime.strptime(TS_KEY_EXPIRY, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        days_left = (expiry - datetime.now(timezone.utc)).days
-        if days_left <= 7:
-            return "expiring", f"Tailscale key expires in {days_left} days ({TS_KEY_EXPIRY})"
-    except ValueError:
-        pass
-    return "ok", None
-
-
 def send_google_chat(text):
     """Send a message to Google Chat webhook."""
     if not GOOGLE_CHAT_WEBHOOK:
@@ -395,12 +382,6 @@ def main():
         print(f"{icon} {name}: {status} — {message}")
         if not is_ok:
             any_failed = True
-
-    # Tailscale key
-    ts_status, ts_msg = check_ts_key_expiry()
-    if ts_status != "ok":
-        print(f"🔑 Tailscale: {ts_msg}")
-        any_failed = True
 
     # Always pull recent Docker logs for visibility
     print("\nFetching Docker logs from pi5 + invoicebuddy...")
@@ -457,9 +438,6 @@ def main():
         healthy = [n for n, r in results.items() if r[0] == "ok"]
         if healthy:
             alert.append(f"_Healthy: {', '.join(healthy)}_")
-        if ts_status != "ok":
-            alert.append(f"*Tailscale:* {ts_msg}")
-
         # Only attach logs for hosts that actually have a failing check. Four
         # unconditional log dumps is what buried the signal last time.
         implicated = set()

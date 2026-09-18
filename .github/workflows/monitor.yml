@@ -9,15 +9,16 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Tailscale
         uses: tailscale/github-action@v3
         with:
-          authkey: ${{ secrets.TS_AUTH_KEY }}
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
 
       - name: Run monitor
         env:
-          TS_KEY_EXPIRY: '2026-12-18'
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
         run: python3 check.py
