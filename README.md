@@ -79,26 +79,41 @@ it never reports healthy for a host it could not scan.
 
 ### Tailscale ACL
 
-The OAuth client mints an ephemeral key tagged `tag:ci` on each run, so the ACL
-needs `tag:ci` plus an SSH accept rule so the GitHub runner can SSH
-into both hosts for Docker log scraping. `dst: autogroup:self` covers every
-device this account owns, so adding hosts needs no ACL change:
+CI authenticates with an OAuth client, which can only mint **tagged** auth
+keys, so the runner joins as `tag:ci`. Tailscale SSH has no tagged-to-untagged
+rule, which is why pi5 and invoicebuddy carry `tag:ais-host`. The member SSH
+rule lists `tag:ais-host` alongside `autogroup:self` — without it, tagging the
+hosts would cut off your own SSH, since a tag-owned device is no longer "self".
 
 ```jsonc
 "tagOwners": {
-    "tag:ci": ["autogroup:admin"],
+    "tag:ci":       ["autogroup:admin"],
+    "tag:ais-host": ["autogroup:admin"],
 },
 
-"ssh": [
+"acls": [
     // ... existing rules ...
+    {"action": "accept", "src": ["tag:ci"], "dst": ["tag:ais-host:22,9123,9200"]},
+],
+
+"ssh": [
+    {
+        "action": "accept",
+        "src":    ["autogroup:member"],
+        "dst":    ["autogroup:self", "tag:ais-host"],
+        "users":  ["autogroup:nonroot", "root", "extremo"],
+    },
     {
         "action": "accept",
         "src":    ["tag:ci"],
-        "dst":    ["autogroup:self"],
+        "dst":    ["tag:ais-host"],
         "users":  ["extremo"],
     },
 ],
 ```
+
+The OAuth client needs the `auth_keys` scope. Keys are minted per run and are
+ephemeral, so there is nothing to rotate.
 
 ### Tailscale SSH on each host
 
