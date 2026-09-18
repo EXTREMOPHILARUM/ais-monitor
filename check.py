@@ -55,7 +55,7 @@ LOG_TARGETS = {
     ("invoicebuddy", INVOICEBUDDY_IP): ("ais-api", "ais-celery-worker"),
 }
 
-TS_KEY_EXPIRY = os.environ.get("TS_KEY_EXPIRY", "2026-09-20")  # workflow overrides; keep in sync
+TS_KEY_EXPIRY = os.environ.get("TS_KEY_EXPIRY", "2026-12-18")  # workflow overrides; keep in sync
 GOOGLE_CHAT_WEBHOOK = os.environ.get("GOOGLE_CHAT_WEBHOOK", "")
 
 
